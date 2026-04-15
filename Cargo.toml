@@ -1,0 +1,12 @@
+[package]
+name = "flowlang"
+version = "0.1.0"
+edition = "2021"
+description = "FlowLang JIT-Edition phase-1 prototype"
+license = "MIT"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]
+pretty_assertions = "1.4"

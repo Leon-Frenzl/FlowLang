@@ -1,0 +1,8 @@
+contract NativeMath {
+    state START {
+        on compute() {
+            10 + 20 + 12;
+            transition -> DONE;
+        }
+    }
+}

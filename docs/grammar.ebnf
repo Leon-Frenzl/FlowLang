@@ -1,0 +1,51 @@
+(* FlowLang DSL - Phase 1 EBNF *)
+
+program             = { item } ;
+item                = shared_contract | contract ;
+
+shared_contract     = "shared_contract" ident "{" { state_decl } "}" ;
+contract            = "contract" ident "{" { state_decl } "}" ;
+
+state_decl          = "state" ident "{" { state_member } "}" ;
+
+state_member        = var_decl | handler_decl ;
+var_decl            = "var" ident ":" type_name "=" expr ";" ;
+
+handler_decl        = "on" ident "(" [ param_list ] ")" block ;
+param_list          = param { "," param } ;
+param               = ident ":" type_name ;
+type_name           = ident ;
+
+block               = "{" { stmt } "}" ;
+
+stmt                = if_stmt
+                    | call_stmt
+                    | let_stmt
+                    | send_stmt
+                    | transition_stmt
+                    | violation_stmt
+                    | drop_stmt
+                    | expr_stmt ;
+
+if_stmt             = "if" "(" expr ")" block [ "else" block ] ;
+call_stmt           = "call" expr ";" ;
+let_stmt            = "let" ident "=" expr ";" ;
+send_stmt           = "send" expr ";" ;
+transition_stmt     = "transition" "->" ident ";" ;
+violation_stmt      = "violation" block ;
+drop_stmt           = "drop" expr ";" ;
+expr_stmt           = expr ";" ;
+
+expr                = comparison ;
+comparison          = additive [ ( "==" | ">" | "<" ) additive ] ;
+additive            = primary { ( "+" | "-" ) primary } ;
+primary             = number | ident_or_call | "(" expr ")" ;
+ident_or_call       = path [ "(" [ arg_list ] ")" ] ;
+arg_list            = expr { "," expr } ;
+path                = ident { "." ident } ;
+
+ident               = letter { letter | digit | "_" } ;
+number              = digit { digit } ;
+
+letter              = "A".."Z" | "a".."z" | "_" ;
+digit               = "0".."9" ;

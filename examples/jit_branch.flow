@@ -1,0 +1,12 @@
+contract NativeBranch {
+    state START {
+        on compute() {
+            if (7 > 3) {
+                100 - 58;
+            } else {
+                1;
+            }
+            transition -> DONE;
+        }
+    }
+}

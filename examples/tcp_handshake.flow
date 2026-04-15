@@ -1,0 +1,26 @@
+shared_contract GlobalRegistry {
+    state DATA {
+        var active_connections: u32 = 0;
+        on increment() {
+            active_connections + 1;
+        }
+    }
+}
+
+contract TCP_Stack {
+    state LISTEN {
+        on receive(p: LinearBuffer) {
+            if (p.has_syn_flag()) {
+                call GlobalRegistry.increment();
+                let response = create_syn_ack(p);
+                send response;
+                transition -> SYN_SENT;
+            } else {
+                violation {
+                    drop p;
+                    send reset();
+                }
+            }
+        }
+    }
+}
