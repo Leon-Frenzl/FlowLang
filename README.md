@@ -50,3 +50,11 @@ Nicht enthalten (noch):
 - Optimierungen wie SSA oder Register Allocation
 
 Siehe [docs/grammar.ebnf](docs/grammar.ebnf) und [docs/architecture.md](docs/architecture.md).
+
+## Production Track
+
+FlowLang wird aktiv als produktionsfaehige Sprache weiterentwickelt.
+
+- Roadmap: [docs/production-roadmap.md](docs/production-roadmap.md)
+- Contribution Guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- CI-Gates: Format, Tests und Clippy muessen bestehen

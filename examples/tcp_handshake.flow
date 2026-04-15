@@ -1,26 +1,32 @@
-shared_contract GlobalRegistry {
-    state DATA {
-        var active_connections: u32 = 0;
-        on increment() {
-            active_connections + 1;
+shared_contract ConnectionRegistry {
+    state Counters {
+        var established_connection_count: u32 = 0;
+        on register_new_connection() {
+            established_connection_count + 1;
         }
     }
 }
 
-contract TCP_Stack {
-    state LISTEN {
-        on receive(p: LinearBuffer) {
-            if (p.has_syn_flag()) {
-                call GlobalRegistry.increment();
-                let response = create_syn_ack(p);
-                send response;
-                transition -> SYN_SENT;
+contract TCPHandshakeProtocol {
+    state WaitForSyn {
+        on on_segment_received(incoming_segment: LinearBuffer) {
+            if (incoming_segment.has_syn_flag()) {
+                call ConnectionRegistry.register_new_connection();
+                let syn_ack_segment = create_syn_ack(incoming_segment);
+                send syn_ack_segment;
+                transition -> WaitForAck;
             } else {
                 violation {
-                    drop p;
+                    drop incoming_segment;
                     send reset();
                 }
             }
+        }
+    }
+
+    state WaitForAck {
+        on on_ack_received() {
+            transition -> WaitForSyn;
         }
     }
 }

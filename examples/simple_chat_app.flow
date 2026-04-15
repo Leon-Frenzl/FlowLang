@@ -1,0 +1,39 @@
+shared_contract ChatAppMetrics {
+    state Counters {
+        var delivered_message_count: u32 = 0;
+        var dropped_message_count: u32 = 0;
+
+        on mark_message_delivered() {
+            delivered_message_count + 1;
+        }
+
+        on mark_message_dropped() {
+            dropped_message_count + 1;
+        }
+    }
+}
+
+contract SimpleChatRelayApp {
+    state WaitForIncomingMessage {
+        on on_message_received(sender_socket: TCPSocket, receiver_socket: TCPSocket, incoming_message: LinearBuffer) {
+            if (incoming_message.is_utf8_text()) {
+                let outbound_message = create_chat_payload(sender_socket, receiver_socket, incoming_message);
+                send outbound_message;
+                call ChatAppMetrics.mark_message_delivered();
+                transition -> WaitForDeliveryAck;
+            } else {
+                violation {
+                    drop incoming_message;
+                    call ChatAppMetrics.mark_message_dropped();
+                    send reset(receiver_socket);
+                }
+            }
+        }
+    }
+
+    state WaitForDeliveryAck {
+        on on_delivery_ack_received() {
+            transition -> WaitForIncomingMessage;
+        }
+    }
+}

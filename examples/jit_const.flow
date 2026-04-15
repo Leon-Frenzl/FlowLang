@@ -1,8 +1,14 @@
-contract NativeMath {
-    state START {
-        on compute() {
+contract ArithmeticEvaluationDemo {
+    state EvaluateExpression {
+        on evaluate_constant_expression() {
             10 + 20 + 12;
-            transition -> DONE;
+            transition -> Completed;
+        }
+    }
+
+    state Completed {
+        on on_idle_tick() {
+            transition -> Completed;
         }
     }
 }

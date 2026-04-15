@@ -772,12 +772,19 @@ fn verify_program(program: &Program) -> Result<(), CompileError> {
         let contract = match item {
             Item::Contract(c) | Item::SharedContract(c) => c,
         };
+        let is_shared = matches!(item, Item::SharedContract(_));
         let contract_name = &contract.name;
+        validate_contract_integrity(contract_name, contract, is_shared, &mut issues);
         for state in &contract.states {
             validate_state_members(contract_name, state, &mut issues);
             for member in &state.members {
                 if let StateMember::Handler(handler) = member {
-                    verify_violation_exhaustiveness(contract_name, &state.name, handler, &mut issues);
+                    verify_violation_exhaustiveness(
+                        contract_name,
+                        &state.name,
+                        handler,
+                        &mut issues,
+                    );
                     let mut linear_env: HashSet<String> = HashSet::new();
                     for p in &handler.params {
                         if is_linear_type(&p.ty) {
@@ -786,7 +793,8 @@ fn verify_program(program: &Program) -> Result<(), CompileError> {
                     }
                     let mut states = vec![linear_env.clone()];
                     for stmt in &handler.body {
-                        states = apply_stmt(stmt, &states, &mut linear_env, &mut issues, &handler.name);
+                        states =
+                            apply_stmt(stmt, &states, &mut linear_env, &mut issues, &handler.name);
                     }
                     for remaining in states {
                         if !remaining.is_empty() {
@@ -815,6 +823,136 @@ fn verify_program(program: &Program) -> Result<(), CompileError> {
 
 fn is_linear_type(ty: &str) -> bool {
     ty.starts_with("Linear")
+}
+
+fn validate_contract_integrity(
+    contract_name: &str,
+    contract: &ContractDecl,
+    is_shared: bool,
+    issues: &mut Vec<VerifyIssue>,
+) {
+    let mut states_seen = HashSet::new();
+    for state in &contract.states {
+        if !states_seen.insert(state.name.clone()) {
+            issues.push(VerifyIssue(format!(
+                "duplicate state '{}.{}'",
+                contract_name, state.name
+            )));
+        }
+    }
+
+    for state in &contract.states {
+        let handlers: Vec<&HandlerDecl> = state
+            .members
+            .iter()
+            .filter_map(|member| {
+                if let StateMember::Handler(h) = member {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !is_shared && handlers.is_empty() {
+            issues.push(VerifyIssue(format!(
+                "state '{}.{}' defines no handlers",
+                contract_name, state.name
+            )));
+        }
+
+        let mut handlers_seen = HashSet::new();
+        for handler in handlers {
+            if !handlers_seen.insert(handler.name.clone()) {
+                issues.push(VerifyIssue(format!(
+                    "duplicate handler '{}.{}.{}'",
+                    contract_name, state.name, handler.name
+                )));
+            }
+
+            if !is_shared && block_falls_through(&handler.body) {
+                issues.push(VerifyIssue(format!(
+                    "handler '{}.{}.{}' has non-terminating control-flow path; each path must end in transition or violation",
+                    contract_name, state.name, handler.name
+                )));
+            }
+
+            let transitions = collect_transitions(&handler.body);
+            for target in transitions {
+                if is_shared {
+                    issues.push(VerifyIssue(format!(
+                        "shared contract handler '{}.{}.{}' must not transition to '{}'",
+                        contract_name, state.name, handler.name, target
+                    )));
+                    continue;
+                }
+
+                if !states_seen.contains(&target) {
+                    issues.push(VerifyIssue(format!(
+                        "handler '{}.{}.{}' transitions to unknown state '{}'",
+                        contract_name, state.name, handler.name, target
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn block_falls_through(stmts: &[Stmt]) -> bool {
+    let mut can_continue = true;
+    for stmt in stmts {
+        if !can_continue {
+            return false;
+        }
+        can_continue = stmt_falls_through(stmt);
+    }
+    can_continue
+}
+
+fn stmt_falls_through(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Transition(_) | Stmt::Violation(_) => false,
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let then_falls = block_falls_through(then_branch);
+            let else_falls = if let Some(else_b) = else_branch {
+                block_falls_through(else_b)
+            } else {
+                true
+            };
+            then_falls || else_falls
+        }
+        _ => true,
+    }
+}
+
+fn collect_transitions(stmts: &[Stmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_transitions_into(stmts, &mut out);
+    out
+}
+
+fn collect_transitions_into(stmts: &[Stmt], out: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Transition(target) => out.push(target.clone()),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_transitions_into(then_branch, out);
+                if let Some(else_b) = else_branch {
+                    collect_transitions_into(else_b, out);
+                }
+            }
+            Stmt::Violation(body) => collect_transitions_into(body, out),
+            _ => {}
+        }
+    }
 }
 
 fn validate_state_members(contract_name: &str, state: &StateDecl, issues: &mut Vec<VerifyIssue>) {
@@ -994,7 +1132,13 @@ fn apply_stmt_single(
             else_branch,
         } => {
             consume_in_expr(cond, &mut st, linear_env, issues, handler_name);
-            let then_states = apply_block(then_branch, vec![st.clone()], linear_env, issues, handler_name);
+            let then_states = apply_block(
+                then_branch,
+                vec![st.clone()],
+                linear_env,
+                issues,
+                handler_name,
+            );
             let else_states = if let Some(else_body) = else_branch {
                 apply_block(else_body, vec![st], linear_env, issues, handler_name)
             } else {
@@ -1120,6 +1264,84 @@ fn eval_const_bool(expr: &Expr) -> Option<bool> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CondKind {
+    Eq,
+    Gt,
+    Lt,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeTarget<'a> {
+    Expr(&'a Expr),
+    Branch {
+        kind: CondKind,
+        lhs: &'a Expr,
+        rhs: &'a Expr,
+        then_expr: &'a Expr,
+        else_expr: &'a Expr,
+    },
+}
+
+fn extract_condition_exprs(cond: &Expr) -> Option<(CondKind, &Expr, &Expr)> {
+    match cond {
+        Expr::Eq(l, r) => Some((CondKind::Eq, l, r)),
+        Expr::Gt(l, r) => Some((CondKind::Gt, l, r)),
+        Expr::Lt(l, r) => Some((CondKind::Lt, l, r)),
+        _ => None,
+    }
+}
+
+fn find_first_native_target(stmts: &[Stmt]) -> Option<NativeTarget<'_>> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr(expr) | Stmt::Send(expr) => {
+                if eval_const_expr(expr).is_some() {
+                    return Some(NativeTarget::Expr(expr));
+                }
+            }
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                if let Some(else_b) = else_branch {
+                    if let Some((kind, lhs, rhs)) = extract_condition_exprs(cond) {
+                        let then_expr = find_first_const_expr(then_branch);
+                        let else_expr = find_first_const_expr(else_b);
+                        if let (Some(then_expr), Some(else_expr)) = (then_expr, else_expr) {
+                            return Some(NativeTarget::Branch {
+                                kind,
+                                lhs,
+                                rhs,
+                                then_expr,
+                                else_expr,
+                            });
+                        }
+                    }
+                }
+
+                if let Some(found) = find_first_native_target(then_branch) {
+                    return Some(found);
+                }
+                if let Some(else_b) = else_branch {
+                    if let Some(found) = find_first_native_target(else_b) {
+                        return Some(found);
+                    }
+                }
+            }
+            Stmt::Violation(body) => {
+                if let Some(found) = find_first_native_target(body) {
+                    return Some(found);
+                }
+            }
+            Stmt::Call(_) | Stmt::Let { .. } | Stmt::Transition(_) | Stmt::Drop(_) => {}
+        }
+    }
+    None
+}
+
 fn find_first_const_expr(stmts: &[Stmt]) -> Option<&Expr> {
     for stmt in stmts {
         match stmt {
@@ -1129,24 +1351,10 @@ fn find_first_const_expr(stmts: &[Stmt]) -> Option<&Expr> {
                 }
             }
             Stmt::If {
-                cond,
                 then_branch,
                 else_branch,
                 ..
             } => {
-                if let Some(cond_value) = eval_const_bool(cond) {
-                    if cond_value {
-                        if let Some(found) = find_first_const_expr(then_branch) {
-                            return Some(found);
-                        }
-                    } else if let Some(else_b) = else_branch {
-                        if let Some(found) = find_first_const_expr(else_b) {
-                            return Some(found);
-                        }
-                    }
-                    continue;
-                }
-
                 if let Some(found) = find_first_const_expr(then_branch) {
                     return Some(found);
                 }
@@ -1189,17 +1397,32 @@ fn collect_add_terms(expr: &Expr, out: &mut Vec<i64>) -> Result<(), CompileError
             }
             Ok(())
         }
-        Expr::Path(_)
-        | Expr::Call { .. }
-        | Expr::Eq(_, _)
-        | Expr::Gt(_, _)
-        | Expr::Lt(_, _) => Err(CompileError::Verify(
-            "native backend supports only constant additive expressions".to_string(),
-        )),
+        Expr::Path(_) | Expr::Call { .. } | Expr::Eq(_, _) | Expr::Gt(_, _) | Expr::Lt(_, _) => {
+            Err(CompileError::Verify(
+                "native backend supports only constant additive expressions".to_string(),
+            ))
+        }
     }
 }
 
-fn build_x86_64_return_expr(expr: &Expr) -> Result<Vec<u8>, CompileError> {
+fn emit_mov_reg_imm64(code: &mut Vec<u8>, reg: u8, value: i64) {
+    // REX.W + MOV r64, imm64: B8+rd
+    code.push(0x48);
+    code.push(0xB8 + reg);
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+fn emit_add_rax_imm32(code: &mut Vec<u8>, value: i32) {
+    code.extend_from_slice(&[0x48, 0x05]);
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+fn emit_add_rcx_imm32(code: &mut Vec<u8>, value: i32) {
+    code.extend_from_slice(&[0x48, 0x81, 0xC1]);
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+fn emit_expr_into_rax(expr: &Expr, code: &mut Vec<u8>) -> Result<(), CompileError> {
     let mut terms = Vec::new();
     collect_add_terms(expr, &mut terms)?;
     if terms.is_empty() {
@@ -1208,22 +1431,98 @@ fn build_x86_64_return_expr(expr: &Expr) -> Result<Vec<u8>, CompileError> {
         ));
     }
 
-    let mut code = vec![0x48, 0xB8]; // mov rax, imm64
-    code.extend_from_slice(&terms[0].to_le_bytes());
-
+    emit_mov_reg_imm64(code, 0, terms[0]); // rax
     for term in terms.iter().skip(1) {
         if let Ok(imm32) = i32::try_from(*term) {
-            // add rax, imm32 (sign-extended)
-            code.extend_from_slice(&[0x48, 0x05]);
-            code.extend_from_slice(&imm32.to_le_bytes());
+            emit_add_rax_imm32(code, imm32);
         } else {
-            // mov rcx, imm64 ; add rax, rcx
-            code.extend_from_slice(&[0x48, 0xB9]);
-            code.extend_from_slice(&term.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0x01, 0xC8]);
+            emit_mov_reg_imm64(code, 2, *term); // rdx
+            code.extend_from_slice(&[0x48, 0x01, 0xD0]); // add rax, rdx
         }
     }
+    Ok(())
+}
 
+fn emit_expr_into_rcx(expr: &Expr, code: &mut Vec<u8>) -> Result<(), CompileError> {
+    let mut terms = Vec::new();
+    collect_add_terms(expr, &mut terms)?;
+    if terms.is_empty() {
+        return Err(CompileError::Verify(
+            "native backend: expression has no terms".to_string(),
+        ));
+    }
+
+    emit_mov_reg_imm64(code, 1, terms[0]); // rcx
+    for term in terms.iter().skip(1) {
+        if let Ok(imm32) = i32::try_from(*term) {
+            emit_add_rcx_imm32(code, imm32);
+        } else {
+            emit_mov_reg_imm64(code, 2, *term); // rdx
+            code.extend_from_slice(&[0x48, 0x01, 0xD1]); // add rcx, rdx
+        }
+    }
+    Ok(())
+}
+
+fn patch_rel32(
+    code: &mut [u8],
+    disp_offset: usize,
+    target_offset: usize,
+) -> Result<(), CompileError> {
+    let src_after_disp = disp_offset + 4;
+    let target = isize::try_from(target_offset)
+        .map_err(|_| CompileError::Verify("native backend: jump target too large".to_string()))?;
+    let src = isize::try_from(src_after_disp)
+        .map_err(|_| CompileError::Verify("native backend: jump source too large".to_string()))?;
+    let rel = target - src;
+    let rel32 = i32::try_from(rel)
+        .map_err(|_| CompileError::Verify("native backend: rel32 out of range".to_string()))?;
+    code[disp_offset..disp_offset + 4].copy_from_slice(&rel32.to_le_bytes());
+    Ok(())
+}
+
+fn build_x86_64_return_expr(expr: &Expr) -> Result<Vec<u8>, CompileError> {
+    let mut code = Vec::new();
+    emit_expr_into_rax(expr, &mut code)?;
+    code.push(0xC3); // ret
+    Ok(code)
+}
+
+fn build_x86_64_return_branch(
+    kind: CondKind,
+    lhs: &Expr,
+    rhs: &Expr,
+    then_expr: &Expr,
+    else_expr: &Expr,
+) -> Result<Vec<u8>, CompileError> {
+    let mut code = Vec::new();
+
+    emit_expr_into_rax(lhs, &mut code)?;
+    emit_expr_into_rcx(rhs, &mut code)?;
+    code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+
+    // Jump to else when condition is false.
+    let jcc = match kind {
+        CondKind::Eq => [0x0F, 0x85], // jne
+        CondKind::Gt => [0x0F, 0x8E], // jle
+        CondKind::Lt => [0x0F, 0x8D], // jge
+    };
+    code.extend_from_slice(&jcc);
+    let jcc_disp_offset = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    emit_expr_into_rax(then_expr, &mut code)?;
+    code.push(0xE9); // jmp end
+    let jmp_end_disp_offset = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    let else_offset = code.len();
+    patch_rel32(&mut code, jcc_disp_offset, else_offset)?;
+
+    emit_expr_into_rax(else_expr, &mut code)?;
+
+    let end_offset = code.len();
+    patch_rel32(&mut code, jmp_end_disp_offset, end_offset)?;
     code.push(0xC3); // ret
     Ok(code)
 }
@@ -1332,18 +1631,50 @@ fn run_native_backend(program: &Program) -> Result<(), CompileError> {
         CompileError::Verify("native backend: no contract handler found".to_string())
     })?;
 
-    let expr = find_first_const_expr(&handler.body).ok_or_else(|| {
+    let target = find_first_native_target(&handler.body).ok_or_else(|| {
         CompileError::Verify(
-            "native backend supports only handlers with at least one constant arithmetic expression"
+            "native backend supports only handlers with constant arithmetic expression targets"
                 .to_string(),
         )
     })?;
 
-    let expected = eval_const_expr(expr).ok_or_else(|| {
-        CompileError::Verify("native backend could not evaluate expression".to_string())
-    })?;
+    let (code, expected) = match target {
+        NativeTarget::Expr(expr) => {
+            let expected = eval_const_expr(expr).ok_or_else(|| {
+                CompileError::Verify("native backend could not evaluate expression".to_string())
+            })?;
+            (build_x86_64_return_expr(expr)?, expected)
+        }
+        NativeTarget::Branch {
+            kind,
+            lhs,
+            rhs,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_expr = match kind {
+                CondKind::Eq => Expr::Eq(Box::new(lhs.clone()), Box::new(rhs.clone())),
+                CondKind::Gt => Expr::Gt(Box::new(lhs.clone()), Box::new(rhs.clone())),
+                CondKind::Lt => Expr::Lt(Box::new(lhs.clone()), Box::new(rhs.clone())),
+            };
+            let cond_true = eval_const_bool(&cond_expr).ok_or_else(|| {
+                CompileError::Verify(
+                    "native backend could not evaluate branch condition".to_string(),
+                )
+            })?;
+            let expected_expr = if cond_true { then_expr } else { else_expr };
+            let expected = eval_const_expr(expected_expr).ok_or_else(|| {
+                CompileError::Verify(
+                    "native backend could not evaluate branch expression".to_string(),
+                )
+            })?;
+            (
+                build_x86_64_return_branch(kind, lhs, rhs, then_expr, else_expr)?,
+                expected,
+            )
+        }
+    };
 
-    let code = build_x86_64_return_expr(expr)?;
     println!("native bytes: {:02X?}", code);
     let exec = ExecutableBuffer::new(&code)?;
     let out = exec.call_i64();
@@ -1552,27 +1883,33 @@ mod tests {
     #[test]
     fn parses_and_verifies_tcp_contract() {
         let source = r#"
-            shared_contract GlobalRegistry {
-                state DATA {
-                    var active_connections: u32 = 0;
-                    on increment() { active_connections + 1; }
+            shared_contract ConnectionRegistry {
+                state Counters {
+                    var established_connection_count: u32 = 0;
+                    on register_new_connection() { established_connection_count + 1; }
                 }
             }
 
-            contract TCP_Stack {
-                state LISTEN {
-                    on receive(p: LinearBuffer) {
-                        if (p.has_syn_flag()) {
-                            call GlobalRegistry.increment();
-                            let response = create_syn_ack(p);
-                            send response;
-                            transition -> SYN_SENT;
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received(incoming_segment: LinearBuffer) {
+                        if (incoming_segment.has_syn_flag()) {
+                            call ConnectionRegistry.register_new_connection();
+                            let syn_ack_segment = create_syn_ack(incoming_segment);
+                            send syn_ack_segment;
+                            transition -> WaitForAck;
                         } else {
                             violation {
-                                drop p;
+                                drop incoming_segment;
                                 send reset();
                             }
                         }
+                    }
+                }
+
+                state WaitForAck {
+                    on on_ack_received() {
+                        transition -> WaitForSyn;
                     }
                 }
             }
@@ -1585,11 +1922,11 @@ mod tests {
     #[test]
     fn fails_without_violation_block_for_linear_handler() {
         let source = r#"
-            contract TCP_Stack {
-                state LISTEN {
-                    on receive(p: LinearBuffer) {
-                        if (p.has_syn_flag()) {
-                            drop p;
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received(incoming_segment: LinearBuffer) {
+                        if (incoming_segment.has_syn_flag()) {
+                            drop incoming_segment;
                         } else {
                             send reset();
                         }
@@ -1608,11 +1945,11 @@ mod tests {
     #[test]
     fn fails_on_if_without_else_for_linear_handler() {
         let source = r#"
-            contract TCP_Stack {
-                state LISTEN {
-                    on receive(p: LinearBuffer) {
-                        if (p.has_syn_flag()) {
-                            drop p;
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received(incoming_segment: LinearBuffer) {
+                        if (incoming_segment.has_syn_flag()) {
+                            drop incoming_segment;
                         }
                         violation {
                             send reset();
@@ -1631,7 +1968,10 @@ mod tests {
     #[test]
     fn evals_const_expression_for_native_subset() {
         let expr = Expr::Sub(
-            Box::new(Expr::Add(Box::new(Expr::Number(50)), Box::new(Expr::Number(10)))),
+            Box::new(Expr::Add(
+                Box::new(Expr::Number(50)),
+                Box::new(Expr::Number(10)),
+            )),
             Box::new(Expr::Number(18)),
         );
         assert_eq!(eval_const_expr(&expr), Some(42));
@@ -1640,7 +1980,10 @@ mod tests {
     #[test]
     fn emits_machine_code_for_const_return() {
         let expr = Expr::Add(
-            Box::new(Expr::Add(Box::new(Expr::Number(10)), Box::new(Expr::Number(20)))),
+            Box::new(Expr::Add(
+                Box::new(Expr::Number(10)),
+                Box::new(Expr::Number(20)),
+            )),
             Box::new(Expr::Number(12)),
         );
         let code = build_x86_64_return_expr(&expr).expect("machine code emission should succeed");
@@ -1654,7 +1997,10 @@ mod tests {
     fn evals_const_comparison_conditions() {
         let gt = Expr::Gt(Box::new(Expr::Number(7)), Box::new(Expr::Number(3)));
         let eq = Expr::Eq(
-            Box::new(Expr::Sub(Box::new(Expr::Number(10)), Box::new(Expr::Number(4)))),
+            Box::new(Expr::Sub(
+                Box::new(Expr::Number(10)),
+                Box::new(Expr::Number(4)),
+            )),
             Box::new(Expr::Number(6)),
         );
         assert_eq!(eval_const_bool(&gt), Some(true));
@@ -1664,7 +2010,16 @@ mod tests {
     #[test]
     fn chooses_const_if_branch_for_native_search() {
         let stmts = vec![Stmt::If {
-            cond: Expr::Gt(Box::new(Expr::Number(5)), Box::new(Expr::Number(2))),
+            cond: Expr::Gt(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Number(2)),
+                    Box::new(Expr::Number(3)),
+                )),
+                Box::new(Expr::Sub(
+                    Box::new(Expr::Number(10)),
+                    Box::new(Expr::Number(8)),
+                )),
+            ),
             then_branch: vec![Stmt::Expr(Expr::Sub(
                 Box::new(Expr::Number(100)),
                 Box::new(Expr::Number(58)),
@@ -1672,7 +2027,154 @@ mod tests {
             else_branch: Some(vec![Stmt::Expr(Expr::Number(1))]),
         }];
 
-        let expr = find_first_const_expr(&stmts).expect("branch expression should exist");
-        assert_eq!(eval_const_expr(expr), Some(42));
+        let target = find_first_native_target(&stmts).expect("native target should exist");
+        match target {
+            NativeTarget::Branch {
+                kind,
+                lhs,
+                rhs,
+                then_expr,
+                else_expr,
+            } => {
+                assert!(matches!(kind, CondKind::Gt));
+                assert_eq!(eval_const_expr(lhs), Some(5));
+                assert_eq!(eval_const_expr(rhs), Some(2));
+                assert_eq!(eval_const_expr(then_expr), Some(42));
+                assert_eq!(eval_const_expr(else_expr), Some(1));
+            }
+            _ => panic!("expected branch target"),
+        }
+    }
+
+    #[test]
+    fn emits_machine_code_for_branch() {
+        let then_expr = Expr::Sub(Box::new(Expr::Number(100)), Box::new(Expr::Number(58)));
+        let else_expr = Expr::Number(1);
+        let lhs = Expr::Add(Box::new(Expr::Number(2)), Box::new(Expr::Number(5)));
+        let rhs = Expr::Sub(Box::new(Expr::Number(10)), Box::new(Expr::Number(7)));
+        let code = build_x86_64_return_branch(CondKind::Gt, &lhs, &rhs, &then_expr, &else_expr)
+            .expect("branch code emission should succeed");
+
+        // 0F 8E = jle, E9 = jmp rel32
+        assert!(code.windows(2).any(|w| w == [0x0F, 0x8E]));
+        assert!(code.contains(&0xE9));
+        assert_eq!(*code.last().unwrap_or(&0), 0xC3);
+    }
+
+    #[test]
+    fn fails_on_unknown_transition_target() {
+        let source = r#"
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received(incoming_segment: LinearBuffer) {
+                        if (incoming_segment.has_syn_flag()) {
+                            drop incoming_segment;
+                            transition -> WaitForAck;
+                        } else {
+                            violation { drop incoming_segment; }
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        let err = verify_program(&program).expect_err("verification should fail");
+        assert!(err.to_string().contains("unknown state 'WaitForAck'"));
+    }
+
+    #[test]
+    fn fails_on_duplicate_states() {
+        let source = r#"
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received() { transition -> WaitForSyn; }
+                }
+                state WaitForSyn {
+                    on on_second_segment_received() { transition -> WaitForSyn; }
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        let err = verify_program(&program).expect_err("verification should fail");
+        assert!(err
+            .to_string()
+            .contains("duplicate state 'TCPHandshakeProtocol.WaitForSyn'"));
+    }
+
+    #[test]
+    fn fails_on_transition_inside_shared_contract() {
+        let source = r#"
+            shared_contract ConnectionRegistry {
+                state Counters {
+                    on register_new_connection() {
+                        transition -> Counters;
+                    }
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        let err = verify_program(&program).expect_err("verification should fail");
+        assert!(err.to_string().contains("must not transition"));
+    }
+
+    #[test]
+    fn fails_on_state_without_handler() {
+        let source = r#"
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    var active: u32 = 0;
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        let err = verify_program(&program).expect_err("verification should fail");
+        assert!(err.to_string().contains("defines no handlers"));
+    }
+
+    #[test]
+    fn fails_when_one_if_path_has_no_terminal_action() {
+        let source = r#"
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received() {
+                        if (1 > 0) {
+                            transition -> WaitForSyn;
+                        } else {
+                            1 + 1;
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        let err = verify_program(&program).expect_err("verification should fail");
+        assert!(err
+            .to_string()
+            .contains("non-terminating control-flow path"));
+    }
+
+    #[test]
+    fn passes_when_all_if_paths_terminate() {
+        let source = r#"
+            contract TCPHandshakeProtocol {
+                state WaitForSyn {
+                    on on_segment_received() {
+                        if (1 > 0) {
+                            transition -> WaitForSyn;
+                        } else {
+                            violation { send reset(); }
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let program = parse_source(source).expect("parser should succeed");
+        verify_program(&program).expect("verification should succeed");
     }
 }

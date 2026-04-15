@@ -1,12 +1,18 @@
-contract NativeBranch {
-    state START {
-        on compute() {
-            if (7 > 3) {
-                100 - 58;
+contract BranchEvaluationDemo {
+    state EvaluateBranch {
+        on evaluate_branch_expression() {
+            if ((2 + 5) > (10 - 7)) {
+                60 - 18;
             } else {
-                1;
+                40 - 39;
             }
-            transition -> DONE;
+            transition -> Completed;
+        }
+    }
+
+    state Completed {
+        on on_idle_tick() {
+            transition -> Completed;
         }
     }
 }

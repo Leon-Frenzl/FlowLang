@@ -1,0 +1,33 @@
+shared_contract RelayMetrics {
+    state Counters {
+        var forwarded_payload_count: u32 = 0;
+
+        on mark_payload_forwarded() {
+            forwarded_payload_count + 1;
+        }
+    }
+}
+
+contract TCPPayloadRelayProtocol {
+    state WaitForPayload {
+        on on_tcp_payload_received(source_socket: TCPSocket, target_socket: TCPSocket, incoming_payload: LinearBuffer) {
+            if (incoming_payload.has_valid_tcp_checksum()) {
+                call RelayMetrics.mark_payload_forwarded();
+                let outbound_segment = create_forward_segment(source_socket, target_socket, incoming_payload);
+                send outbound_segment;
+                transition -> WaitForEgressAck;
+            } else {
+                violation {
+                    drop incoming_payload;
+                    send reset(target_socket);
+                }
+            }
+        }
+    }
+
+    state WaitForEgressAck {
+        on on_target_ack_received() {
+            transition -> WaitForPayload;
+        }
+    }
+}

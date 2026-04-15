@@ -29,6 +29,19 @@ Fuer Handler mit linearen Eingaben erzwingt der Verifier in Phase 1:
 
 Verletzungen dieser Regeln fuehren zu einem Compile-Error.
 
+## Contract-Integritaet (Unbreakable Contracts)
+
+Der Verifier erzwingt zusaetzlich strukturelle Vertragsregeln:
+
+- Keine doppelten State-Namen innerhalb eines Contracts.
+- Keine doppelten Handler-Namen innerhalb eines States.
+- Jeder State in `contract` muss mindestens einen Handler besitzen.
+- Jede `transition -> TARGET;` muss auf einen existierenden State zeigen.
+- `shared_contract`-Handler duerfen keine Transition ausfuehren.
+- In `contract`-Handlern muss jeder Kontrollfluss-Pfad mit `transition` oder `violation` terminieren.
+
+Damit sind ungueltige Zustandsautomaten zur Compile-Zeit ausgeschlossen.
+
 ## Bytecode-Modell
 
 Die VM arbeitet mit einer kleinen Instruktionsmenge:
